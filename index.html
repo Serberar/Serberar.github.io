@@ -32,6 +32,10 @@
   .pc.off { opacity: .55; pointer-events: none; }
   button { padding: 10px 18px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel);
            color: var(--text); font-size: 15px; }
+  .ask { width: 100%; max-width: 360px; padding: 16px; border-radius: 14px; background: var(--panel);
+         border: 1px solid var(--border); display: flex; flex-direction: column; gap: 12px; text-align: center; }
+  .ask .btns { display: flex; gap: 10px; justify-content: center; }
+  .ask .yes { background: var(--accent); border-color: var(--accent); color: #fff; }
 </style>
 </head>
 <body>
@@ -41,6 +45,10 @@
   <p id="status">Buscando tus ordenadores…</p>
   <div class="list" id="list"></div>
   <button id="retry" style="display:none;">Volver a buscar</button>
+  <div class="ask" id="ask" style="display:none;">
+    <p>🔔 ¿Quieres que Chati te avise en el móvil cuando termine una tarea o te necesite, aunque esté cerrada?</p>
+    <div class="btns"><button class="yes" id="askYes">Activar avisos</button><button id="askNo">Ahora no</button></div>
+  </div>
 </main>
 <script>
 // Pantalla de inicio de Chati: pregunta a cada ordenador si esta encendido.
@@ -64,6 +72,80 @@ async function isOn(pc) {
   }
 }
 
+// --- Avisos: un service worker por ordenador (alcance avisos/<nombre>/),
+// suscrito con la clave de su Chati. La suscripcion se le pasa a Chati en la
+// direccion al entrar (#push=...) y ella la guarda en la cuenta.
+const PUSH_FLAG = "chati_avisos";  // "on" activados, "no" el usuario no quiso
+const canPush = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+
+function pushFlag() {
+  try { return localStorage.getItem(PUSH_FLAG); } catch (e) { return null; }
+}
+
+function b64ToBytes(text) {
+  const b64 = (text + "=".repeat((4 - (text.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/");
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+function bytesToB64(bytes) {
+  let bin = "";
+  new Uint8Array(bytes).forEach((b) => { bin += String.fromCharCode(b); });
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function activeWorker(reg) {
+  if (reg.active) return;
+  const w = reg.installing || reg.waiting;
+  await new Promise((resolve) => w.addEventListener("statechange", () => { if (w.state === "activated") resolve(); }));
+}
+
+async function subscriptionFor(pc) {
+  const { key } = await (await fetch(pc.url + "push/key", { cache: "no-store" })).json();
+  const reg = await navigator.serviceWorker.register("avisos/sw.js", { scope: "avisos/" + pc.name + "/" });
+  await activeWorker(reg);
+  let sub = await reg.pushManager.getSubscription();
+  const used = sub && sub.options && sub.options.applicationServerKey;
+  if (used && bytesToB64(used) !== key) {  // Chati con claves nuevas
+    await sub.unsubscribe();
+    sub = null;
+  }
+  return sub || reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
+}
+
+async function pushHash(pc) {
+  if (!canPush || pushFlag() !== "on" || Notification.permission !== "granted") return "";
+  try {
+    const sub = await subscriptionFor(pc);
+    return "#push=" + bytesToB64(new TextEncoder().encode(JSON.stringify(sub.toJSON())));
+  } catch (e) {
+    return "";  // ese Chati aun no tiene avisos (version vieja): se entra igual
+  }
+}
+
+async function enter(pc) {
+  location.replace(pc.url + await pushHash(pc));
+}
+
+function askForPush() {
+  // solo en el icono instalado (en Safari normal no hay avisos) y una vez
+  if (!canPush || pushFlag() || Notification.permission === "denied") return Promise.resolve();
+  const ask = document.getElementById("ask");
+  ask.style.display = "flex";
+  return new Promise((resolve) => {
+    document.getElementById("askYes").onclick = async () => {
+      const ok = (await Notification.requestPermission()) === "granted";
+      try { localStorage.setItem(PUSH_FLAG, ok ? "on" : "no"); } catch (e) { /* nada */ }
+      ask.style.display = "none";
+      resolve();
+    };
+    document.getElementById("askNo").onclick = () => {
+      try { localStorage.setItem(PUSH_FLAG, "no"); } catch (e) { /* nada */ }
+      ask.style.display = "none";
+      resolve();
+    };
+  });
+}
+
 async function search() {
   const status = document.getElementById("status");
   const list = document.getElementById("list");
@@ -75,7 +157,7 @@ async function search() {
   const on = COMPUTERS.filter((pc, i) => states[i]);
   if (on.length === 1) {
     status.textContent = `Entrando en ${on[0].name}…`;
-    location.replace(on[0].url);
+    enter(on[0]);
     return;
   }
   status.textContent = on.length ? "¿En qué ordenador quieres entrar?"
@@ -84,6 +166,7 @@ async function search() {
     const a = document.createElement("a");
     a.className = "pc " + (states[i] ? "on" : "off");
     a.href = pc.url;
+    a.addEventListener("click", (e) => { e.preventDefault(); enter(pc); });
     a.innerHTML = '<span class="dot"></span><span class="name"></span><span class="state"></span>';
     a.querySelector(".name").textContent = pc.name;
     a.querySelector(".state").textContent = states[i] ? "Encendido" : "Apagado";
@@ -93,7 +176,7 @@ async function search() {
 }
 
 document.getElementById("retry").addEventListener("click", search);
-search();
+askForPush().then(search);
 </script>
 </body>
 </html>
